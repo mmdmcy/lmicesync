@@ -1,0 +1,10 @@
+[Unit]
+Description=lmicesync periodic auto-save
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/lmicesync save
+
+[Install]
+WantedBy=timers.target
