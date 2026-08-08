@@ -1,0 +1,9 @@
+[Unit]
+Description=lmicesync periodic peer sync
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/lmicesync sync
+
+[Install]
+WantedBy=timers.target

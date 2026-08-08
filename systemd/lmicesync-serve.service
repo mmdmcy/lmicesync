@@ -1,0 +1,13 @@
+[Unit]
+Description=lmicesync LAN agent (UDP beacon + HTTP bundle server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/lmicesync serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
