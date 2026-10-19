@@ -4,7 +4,11 @@
 package serve
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -13,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,7 +25,12 @@ import (
 	"github.com/mmdmcy/lmicesync/internal/scan"
 )
 
-const defaultBeaconPort = 10001
+const (
+	defaultHTTPPort = 7370
+	// beaconWindow bounds clock skew between peers: a beacon whose ts is
+	// further than this from the receiver's clock is dropped as stale.
+	beaconWindow = 60 * time.Second
+)
 
 // Peer describes a discovered device.
 type Peer struct {
@@ -30,9 +40,59 @@ type Peer struct {
 	Discovered string `json:"discovered,omitempty"`
 }
 
+// beaconMsg is both the discovery request (broadcast) and the reply
+// (unicast). Both are authenticated with the shared token: MAC is
+// hex(HMAC-SHA256(token, role|device|http_port|ts|nonce)). A reply echoes the
+// request's nonce, so a reply can only answer the request it was made for;
+// anything unsigned, wrongly signed, stale or for another nonce is ignored.
+// The token therefore only ever goes (over HTTP) to a host that proved it
+// already holds it.
 type beaconMsg struct {
 	Device   string `json:"device"`
 	HTTPPort int    `json:"http_port"`
+	TS       int64  `json:"ts,omitempty"`    // unix seconds
+	Nonce    string `json:"nonce,omitempty"` // 16 hex chars
+	MAC      string `json:"mac,omitempty"`   // 64 hex chars
+}
+
+const (
+	roleRequest = "lmicesync.v1/request"
+	roleReply   = "lmicesync.v1/reply"
+)
+
+func beaconMAC(token, role string, m beaconMsg) []byte {
+	mac := hmac.New(sha256.New, []byte(token))
+	fmt.Fprintf(mac, "%s\n%s\n%d\n%d\n%s", role, m.Device, m.HTTPPort, m.TS, m.Nonce)
+	return mac.Sum(nil)
+}
+
+func newNonce() (string, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// signBeacon stamps m with now and the MAC for role. Nonce must be set.
+func signBeacon(token, role string, m beaconMsg, now time.Time) beaconMsg {
+	m.TS = now.Unix()
+	m.MAC = hex.EncodeToString(beaconMAC(token, role, m))
+	return m
+}
+
+// verifyBeacon reports whether m is well formed, fresh and signed with token
+// for role. With wantNonce set, m must carry exactly that nonce.
+func verifyBeacon(token, role string, m beaconMsg, wantNonce string, now time.Time) bool {
+	if token == "" || m.Device == "" || m.Nonce == "" || (wantNonce != "" && m.Nonce != wantNonce) {
+		return false
+	}
+	got, err := hex.DecodeString(m.MAC)
+	if err != nil || !hmac.Equal(got, beaconMAC(token, role, m)) {
+		return false
+	}
+	age := now.Sub(time.Unix(m.TS, 0))
+	return age <= beaconWindow && age >= -beaconWindow
 }
 
 func ownAddr() string {
@@ -44,12 +104,34 @@ func ownAddr() string {
 	return strings.Split(conn.LocalAddr().String(), ":")[0]
 }
 
+// splitHTTPAddr parses http_addr ("host:port", ":port" or "port") into the
+// host to bind (empty = all interfaces) and the port.
+func splitHTTPAddr(addr string) (host string, port int, err error) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return "", defaultHTTPPort, nil
+	}
+	portStr := addr
+	if strings.Contains(addr, ":") {
+		if host, portStr, err = net.SplitHostPort(addr); err != nil {
+			return "", 0, fmt.Errorf("http_addr %q: %w", addr, err)
+		}
+	}
+	if portStr == "" {
+		return host, defaultHTTPPort, nil
+	}
+	port, err = strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return "", 0, fmt.Errorf("http_addr %q: invalid port %q", addr, portStr)
+	}
+	return host, port, nil
+}
+
 // httpPortFor extracts the configured HTTP port from http_addr.
 func httpPortFor(cfg *config.Config) int {
-	addr := cfg.HTTPAddr
-	port := 7370
-	if idx := strings.LastIndex(addr, ":"); idx >= 0 {
-		fmt.Sscanf(addr[idx+1:], "%d", &port)
+	_, port, err := splitHTTPAddr(cfg.HTTPAddr)
+	if err != nil {
+		return defaultHTTPPort
 	}
 	return port
 }
@@ -68,11 +150,14 @@ func Run(cfg *config.Config) error {
 		byName[filepath.Base(r)] = r
 	}
 
-	httpAddr := cfg.HTTPAddr
-	if strings.HasPrefix(httpAddr, ":") {
-		httpAddr = ownAddr() + httpAddr
+	host, port, err := splitHTTPAddr(cfg.HTTPAddr)
+	if err != nil {
+		return err
 	}
-	port := httpPortFor(cfg)
+	shown := host
+	if shown == "" {
+		shown = ownAddr()
+	}
 
 	go beaconResponder(cfg, port)
 
@@ -97,8 +182,9 @@ func Run(cfg *config.Config) error {
 		}
 		bundleRepo(w, req, dir)
 	})
-	fmt.Printf("lmicesync agent on http://%s:%d (device %s)\n", ownAddr(), port, cfg.Device)
-	return http.ListenAndServe(fmt.Sprintf(":%d", port), mux)
+	fmt.Printf("lmicesync agent on http://%s (device %s)\n", net.JoinHostPort(shown, strconv.Itoa(port)), cfg.Device)
+	// Bind exactly what http_addr says: "127.0.0.1:7370" stays on loopback.
+	return http.ListenAndServe(net.JoinHostPort(host, strconv.Itoa(port)), mux)
 }
 
 func authorized(r *http.Request, cfg *config.Config) bool {
@@ -107,7 +193,10 @@ func authorized(r *http.Request, cfg *config.Config) bool {
 }
 
 // peerApproved reports whether the requesting device may pull bundles. With
-// require_approval off, every device is approved.
+// require_approval off, every device is approved. The device name is the
+// caller's own claim (?device=): every caller already holds the shared
+// token, so this is a convenience allowlist (serve only to fleet members I
+// listed), not access control against a token holder.
 func peerApproved(device string, cfg *config.Config) bool {
 	if !cfg.RequireApproval {
 		return true
@@ -172,25 +261,36 @@ func beaconResponder(cfg *config.Config, httpPort int) {
 			return
 		}
 		var msg beaconMsg
-		if json.Unmarshal(buf[:n], &msg) != nil || msg.Device == "" {
+		if json.Unmarshal(buf[:n], &msg) != nil || msg.Device == cfg.Device {
 			continue
 		}
-		if msg.Device == cfg.Device {
-			continue
+		if !verifyBeacon(cfg.Token, roleRequest, msg, "", time.Now()) {
+			continue // unsigned, wrong token or stale: never answer
 		}
-		reply, _ := json.Marshal(beaconMsg{Device: cfg.Device, HTTPPort: httpPort})
+		reply, _ := json.Marshal(signBeacon(cfg.Token, roleReply,
+			beaconMsg{Device: cfg.Device, HTTPPort: httpPort, Nonce: msg.Nonce}, time.Now()))
 		_, _ = conn.WriteTo(reply, addr)
 	}
 }
 
-// Discover broadcasts a beacon and collects peer replies for the given wait.
+// Discover broadcasts a signed beacon and collects peer replies for the given
+// wait. Only replies signed with the shared token for this request's nonce
+// are returned.
 func Discover(cfg *config.Config, wait time.Duration) ([]Peer, error) {
+	if cfg.Token == "" {
+		return nil, fmt.Errorf("discovery requires a token; set LMICESYNC_TOKEN or add token to the config")
+	}
+	nonce, err := newNonce()
+	if err != nil {
+		return nil, err
+	}
 	conn, err := net.ListenPacket("udp", ":0")
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
-	msg, _ := json.Marshal(beaconMsg{Device: cfg.Device, HTTPPort: httpPortFor(cfg)})
+	msg, _ := json.Marshal(signBeacon(cfg.Token, roleRequest,
+		beaconMsg{Device: cfg.Device, HTTPPort: httpPortFor(cfg), Nonce: nonce}, time.Now()))
 	for _, ip := range []net.IP{net.IPv4(255, 255, 255, 255), net.IPv4(127, 0, 0, 1)} {
 		if _, err := conn.WriteTo(msg, &net.UDPAddr{IP: ip, Port: cfg.BeaconPort}); err != nil {
 			return nil, err
@@ -207,14 +307,14 @@ func Discover(cfg *config.Config, wait time.Duration) ([]Peer, error) {
 			break
 		}
 		var reply beaconMsg
-		if json.Unmarshal(buf[:n], &reply) != nil || reply.Device == "" ||
-			reply.Device == cfg.Device {
+		if json.Unmarshal(buf[:n], &reply) != nil || reply.Device == cfg.Device ||
+			!verifyBeacon(cfg.Token, roleReply, reply, nonce, time.Now()) {
 			continue
 		}
 		host := strings.Split(from.String(), ":")[0]
 		port := reply.HTTPPort
 		if port == 0 {
-			port = 7370
+			port = defaultHTTPPort
 		}
 		key := reply.Device + "@" + host
 		if seen[key] {
